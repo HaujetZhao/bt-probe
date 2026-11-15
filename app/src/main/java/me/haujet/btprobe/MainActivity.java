@@ -30,14 +30,21 @@ import java.util.concurrent.locks.LockSupport;
  * Streams raw RFCOMM frames at the phone's own pace so the laptop can measure what the
  * Bluetooth link itself sustains, with none of Edgepad's batching in the way.
  *
- * Frames are the same 5 bytes as Edgepad's MOVE: 0x10, 0x00, seq low, seq high, 0x00.
+ * Movement frames are 5 bytes: 0x10, dx, dy, seq low, 0x00, with dx/dy signed deltas.
  * A test sends a statistics line over the same socket when it ends, prefixed with 'S'.
  */
 public class MainActivity extends Activity {
 
     private static final UUID SERVICE = UUID.fromString("8e9a2f6c-5b3e-4d1a-9c7f-2a6b8d0e1f35");
     private static final int DURATION_MS = 10000;
+    private static final int CIRCLE_DURATION_MS = 15000;
     private static final int MAX_SAMPLES = 400000;
+
+    /** Circle the cursor is told to trace: 220 px radius at 900 px/s along the arc. */
+    private static final double CIRCLE_RADIUS = 220.0;
+    private static final double CIRCLE_SPEED = 900.0;
+    private static final double CIRCLE_OMEGA = CIRCLE_SPEED / CIRCLE_RADIUS;
+    private static final int MAX_DELTA = 120;
 
     private final List<Button> buttons = new ArrayList<>();
     private final StringBuilder transcript = new StringBuilder();
@@ -90,7 +97,7 @@ public class MainActivity extends Activity {
             }
         }
 
-        addHeading(root, "测试（每种 10 秒）");
+        addHeading(root, "吞吐测试（每种 10 秒）");
         LinearLayout tests = new LinearLayout(this);
         tests.setOrientation(LinearLayout.VERTICAL);
         root.addView(tests);
@@ -99,6 +106,15 @@ public class MainActivity extends Activity {
         addTest(tests, "不限速，50 字节帧", 0, 50);
         addTest(tests, "固定 120 Hz，5 字节帧", 120, 5);
         addTest(tests, "固定 240 Hz，5 字节帧", 240, 5);
+
+        addHeading(root, "画圈（半径 220px，900px/s，每种 15 秒）");
+        LinearLayout circles = new LinearLayout(this);
+        circles.setOrientation(LinearLayout.VERTICAL);
+        root.addView(circles);
+
+        for (int hz : new int[] {60, 90, 120, 240}) {
+            addCircle(circles, hz);
+        }
 
         addHeading(root, "结果");
         result = new TextView(this);
@@ -123,6 +139,23 @@ public class MainActivity extends Activity {
                 return;
             }
             new Thread(() -> runTest(label, hz, size), "probe-" + hz).start();
+        });
+    }
+
+    private void addCircle(LinearLayout parent, int hz) {
+        String label = "画圈 " + hz + "Hz（15 秒）";
+        Button b = addButton(parent, label);
+        buttons.add(b);
+        b.setOnClickListener(v -> {
+            if (socket == null || out == null) {
+                toast("先连电脑");
+                return;
+            }
+            if (running) {
+                toast("还在跑");
+                return;
+            }
+            new Thread(() -> runCircle(label, hz), "circle-" + hz).start();
         });
     }
 
@@ -225,8 +258,13 @@ public class MainActivity extends Activity {
                     next += period;
                     if (next < System.nanoTime() - period) next = System.nanoTime();
                 }
-                frame[2] = (byte) count;
-                frame[3] = (byte) (count >> 8);
+                if (size == 5) {
+                    // Movement frame with a zero delta: 0x10 dx dy seq 0x00.
+                    frame[3] = (byte) count;
+                } else {
+                    frame[2] = (byte) count;
+                    frame[3] = (byte) (count >> 8);
+                }
                 long t0 = System.nanoTime();
                 out.write(frame);
                 long t1 = System.nanoTime();
@@ -266,6 +304,110 @@ public class MainActivity extends Activity {
         }
         if (failure != null) sb.append(" failed=").append(failure.replace(' ', '_'));
         return sb.toString();
+    }
+
+    /**
+     * Traces the same 220 px circle at 900 px/s for every rate. The angle comes from elapsed
+     * real time and each frame carries the rounded movement since the previous one, so
+     * rounding cannot accumulate: the emitted position always tracks the exact one.
+     */
+    private void runCircle(String label, int hz) {
+        running = true;
+        setButtons(false);
+        say("开始：" + label);
+
+        byte[] frame = new byte[5];
+        frame[0] = 0x10;
+        int maxFrames = (CIRCLE_DURATION_MS / 1000 + 1) * hz;
+        long[] durations = new long[Math.min(MAX_SAMPLES, maxFrames)];
+        int sentX = (int) Math.round(CIRCLE_RADIUS);
+        int sentY = 0;
+        int count = 0;
+        long start = System.nanoTime();
+        long end = start + CIRCLE_DURATION_MS * 1_000_000L;
+        long period = 1_000_000_000L / hz;
+        long next = start + period;
+        long slow5 = 0;
+        long slow10 = 0;
+        double stepMin = Double.MAX_VALUE;
+        double stepMax = 0.0;
+        String failure = null;
+
+        try {
+            while (true) {
+                long now = System.nanoTime();
+                if (now >= end) break;
+                if (next > now) {
+                    LockSupport.parkNanos(next - now);
+                    now = System.nanoTime();
+                    if (now >= end) break;
+                } else if (now - next > period) {
+                    // More than one slot behind: drop the missed slots instead of bursting.
+                    next = now;
+                }
+                double angle = CIRCLE_OMEGA * ((now - start) / 1e9);
+                int x = (int) Math.round(CIRCLE_RADIUS * Math.cos(angle));
+                int y = (int) Math.round(CIRCLE_RADIUS * Math.sin(angle));
+                int dx = clamp(x - sentX);
+                int dy = clamp(y - sentY);
+                sentX += dx;
+                sentY += dy;
+
+                frame[1] = (byte) dx;
+                frame[2] = (byte) dy;
+                frame[3] = (byte) count;
+                long t0 = System.nanoTime();
+                out.write(frame);
+                long t1 = System.nanoTime();
+                long d = t1 - t0;
+                if (count < durations.length) durations[count] = d;
+                count++;
+                double step = Math.hypot(dx, dy);
+                if (step < stepMin) stepMin = step;
+                if (step > stepMax) stepMax = step;
+                if (d > 5_000_000L) slow5++;
+                if (d > 10_000_000L) slow10++;
+                next += period;
+            }
+            out.flush();
+        } catch (Exception e) {
+            failure = e.toString();
+        }
+
+        long elapsed = System.nanoTime() - start;
+        String summary = summariseCircle(label, hz, count, elapsed, durations,
+                stepMin, stepMax, slow5, slow10, failure);
+        say(summary);
+        sendStats(summary);
+        running = false;
+        setButtons(true);
+    }
+
+    private String summariseCircle(String label, int hz, int count, long elapsedNs, long[] d,
+                                   double stepMin, double stepMax, long slow5, long slow10,
+                                   String failure) {
+        int n = Math.min(count, d.length);
+        long[] copy = Arrays.copyOf(d, Math.max(n, 1));
+        Arrays.sort(copy, 0, n);
+        double secs = elapsedNs / 1e9;
+        StringBuilder sb = new StringBuilder();
+        sb.append("mode=circle").append(hz).append(" bytes=5 hz=").append(hz);
+        sb.append(" n=").append(count);
+        sb.append(String.format(java.util.Locale.US, " dur=%.2fs rate=%.1f/s", secs, count / secs));
+        if (n > 0 && stepMax > 0) {
+            sb.append(String.format(java.util.Locale.US, " stepmin=%.1fpx stepmax=%.1fpx",
+                    stepMin, stepMax));
+            sb.append(String.format(java.util.Locale.US, " wmed=%.3fms wp90=%.3fms wmax=%.3fms",
+                    copy[n / 2] / 1e6, copy[(int) (n * 0.9)] / 1e6, copy[n - 1] / 1e6));
+            sb.append(" slow5=").append(slow5).append(" slow10=").append(slow10);
+        }
+        if (failure != null) sb.append(" failed=").append(failure.replace(' ', '_'));
+        return sb.toString();
+    }
+
+    private static int clamp(int value) {
+        if (value < -MAX_DELTA) return -MAX_DELTA;
+        return value > MAX_DELTA ? MAX_DELTA : value;
     }
 
     private void sendStats(String text) {

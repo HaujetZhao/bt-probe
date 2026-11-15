@@ -28,6 +28,25 @@ jobs:
       - name: Build
         run: gradle assembleDebug --no-daemon --stacktrace
 
+      - name: Sign APK
+        env:
+          KS_B64: ${{ secrets.BT_PROBE_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.BT_PROBE_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          if [ -z "${KS_B64:-}" ] || [ -z "${KS_PASS:-}" ]; then
+            echo "::warning::BT_PROBE_KEYSTORE_BASE64 / BT_PROBE_KEYSTORE_PASSWORD not set; keeping the debug signature"
+            exit 0
+          fi
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "$BUILD_TOOLS" >> "$GITHUB_PATH"
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/btprobe.p12"
+          zip -q -d "$APK" 'META-INF/*.RSA' 'META-INF/*.SF' 'META-INF/*.DSA' 'META-INF/*.EC' || true
+          zipalign -f -p 4 "$APK" aligned.apk
+          apksigner sign --ks "$RUNNER_TEMP/btprobe.p12" --ks-type pkcs12 --ks-pass env:KS_PASS --key-pass env:KS_PASS --out "$APK" aligned.apk
+          apksigner verify --print-certs "$APK"
+
       - uses: actions/upload-artifact@v4
         with:
           name: btprobe-debug
