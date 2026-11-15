@@ -44,7 +44,9 @@ public class MainActivity extends Activity {
 
     private TextView status;
     private TextView result;
+    private BluetoothAdapter adapter;
     private BluetoothSocket socket;
+    private volatile String lastError = "";
     private OutputStream out;
     private volatile boolean running;
 
@@ -74,7 +76,7 @@ public class MainActivity extends Activity {
         devices.setOrientation(LinearLayout.VERTICAL);
         root.addView(devices);
 
-        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        adapter = BluetoothAdapter.getDefaultAdapter();
         if (adapter == null) {
             status.setText("这台设备没有蓝牙");
         } else {
@@ -129,18 +131,72 @@ public class MainActivity extends Activity {
             toast("还在跑");
             return;
         }
+        if (adapter == null) {
+            toast("没有蓝牙适配器");
+            return;
+        }
         status.setText("连接 " + safeName(device) + " …");
         new Thread(() -> {
-            try {
-                BluetoothSocket s = device.createRfcommSocketToServiceRecord(SERVICE);
-                s.connect();
-                socket = s;
-                out = s.getOutputStream();
-                say("已连接 " + safeName(device) + " / " + device.getAddress());
-            } catch (Exception e) {
-                status.setText("连接失败：" + e);
+            BluetoothSocket s = open(device);
+            if (s == null) {
+                final String why = lastError;
+                runOnUiThread(() -> status.setText("连接失败：" + why));
+                return;
             }
+            try {
+                out = s.getOutputStream();
+            } catch (Exception e) {
+                try {
+                    s.close();
+                } catch (Exception ignored) {
+                    // Already dead.
+                }
+                final String why2 = "拿不到输出流：" + e;
+                runOnUiThread(() -> status.setText(why2));
+                return;
+            }
+            socket = s;
+            final String label = safeName(device) + " / " + device.getAddress();
+            runOnUiThread(() -> status.setText("已连接 " + label));
+            say("已连接 " + label);
         }, "connect").start();
+    }
+
+    /**
+     * Discovery first: an SDP lookup during discovery on some phones fails or takes seconds.
+     * Both socket flavours, in the order the CapsLock demo uses, because the secure one is
+     * refused on some pairings and the insecure one on others.
+     */
+    private BluetoothSocket open(BluetoothDevice device) {
+        try {
+            adapter.cancelDiscovery();
+        } catch (Exception ignored) {
+            // Cancelling discovery is a courtesy, not a requirement.
+        }
+        for (int mode = 0; mode < 2; mode++) {
+            BluetoothSocket s = null;
+            try {
+                s = mode == 0
+                        ? device.createRfcommSocketToServiceRecord(SERVICE)
+                        : device.createInsecureRfcommSocketToServiceRecord(SERVICE);
+                if (s == null) {
+                    lastError = "socket 为空";
+                    continue;
+                }
+                s.connect();
+                return s;
+            } catch (Exception e) {
+                lastError = (mode == 0 ? "安全" : "不安全") + " socket：" + e;
+                if (s != null) {
+                    try {
+                        s.close();
+                    } catch (Exception ignored) {
+                        // Nothing to clean up.
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     private void runTest(String label, int hz, int size) {
