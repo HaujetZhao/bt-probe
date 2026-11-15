@@ -40,7 +40,7 @@ jobs:
             exit 0
           fi
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          echo "$BUILD_TOOLS" >> "$GITHUB_PATH"
+          export PATH="$BUILD_TOOLS:$PATH"
           echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/btprobe.p12"
           zip -q -d "$APK" 'META-INF/*.RSA' 'META-INF/*.SF' 'META-INF/*.DSA' 'META-INF/*.EC' || true
           zipalign -f -p 4 "$APK" aligned.apk
